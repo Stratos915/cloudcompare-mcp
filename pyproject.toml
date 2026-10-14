@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cloudcompare-mcp"
+version = "0.3.0"
+description = "Cross-platform MCP server for CloudCompare point cloud processing (fork tuned for cave / 3D surveys)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["cloudcompare", "mcp", "point-cloud", "lidar", "3d"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+dependencies = [
+    "mcp[cli]>=1.3.0,<2",
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+    "laspy[lazrs]>=2.5",
+    "plyfile>=0.9",
+    "scipy>=1.10",
+]
+
+[project.scripts]
+cloudcompare-mcp = "cloudcompare_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/Stratos915/cloudcompare-mcp"
+Repository = "https://github.com/Stratos915/cloudcompare-mcp"
+Issues = "https://github.com/Stratos915/cloudcompare-mcp/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cloudcompare_mcp"]

@@ -15,6 +15,7 @@ Fork with fixes for underground / 3D surveys (caves, tunnels, hypogea):
 import base64
 import io
 import json
+import math
 import os
 import platform
 import shutil
@@ -26,6 +27,8 @@ from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import ImageContent, TextContent, Tool
+
+from . import survey
 
 # ── CloudCompare binary discovery ────────────────────────────────────────────
 
@@ -109,9 +112,22 @@ def cc_run(
     return rc, stdout, stderr
 
 
-def _open(path: str) -> list[str]:
-    """-O with automatic global shift (avoids precision loss with UTM / national grid coords)."""
+def _open(path: str, shift: tuple[float, float, float] | None = None) -> list[str]:
+    """-O with a global shift (avoids float32 precision loss with UTM / national grid coords).
+
+    When several files are opened in one command they MUST share the same shift, otherwise
+    CloudCompare may re-centre each file differently and ICP / C2C / merge mix frames.
+    """
+    if shift is not None:
+        return ["-O", "-GLOBAL_SHIFT", *(f"{v:.3f}" for v in shift), path]
     return ["-O", "-GLOBAL_SHIFT", "AUTO", path]
+
+
+def _shift(*paths: str) -> tuple[float, float, float] | None:
+    try:
+        return survey.common_shift(list(paths))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _quote(path: str) -> str:
@@ -786,6 +802,82 @@ TOOLS: list[Tool] = [
         },
     ),
     Tool(
+        name="cut_ceiling",
+        description=(
+            "Scappellamento: remove the vault/ceiling of a cave survey to show the plan. Native, no CloudCompare. "
+            "mode 'floor' (default) keeps points from the local floor up to `height` metres above it, cell by cell, "
+            "so it works on sloping passages and recognises stacked galleries (multi-level caves). "
+            "With min_height + height it extracts a horizontal band, e.g. min_height 0.95, height 1.05 = classic plan slice at 1 m. "
+            "mode 'absolute' keeps z_min <= Z <= z_max. The original file is never modified; sections should be "
+            "extracted from the full (uncut) cloud. Adds a HeightAboveFloor field. Input and output must be LAS/LAZ."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string", "description": "Absolute path of the LAS/LAZ to cut."},
+                "output_path": {"type": "string", "description": "Absolute path of the result (.las or .laz)."},
+                "mode": {"type": "string", "enum": ["floor", "absolute"], "default": "floor"},
+                "height": {"type": "number", "default": 1.5, "description": "floor mode: keep up to this height above the local floor (m)."},
+                "min_height": {"type": "number", "description": "floor mode, optional: drop points lower than this above the floor (for plan slices)."},
+                "z_min": {"type": "number", "description": "absolute mode: lowest Z kept."},
+                "z_max": {"type": "number", "description": "absolute mode: highest Z kept."},
+                "cell_size": {"type": "number", "default": 0.5, "description": "floor mode: grid cell (m). Smaller for narrow passages (0.25), larger for big chambers (1.0)."},
+                "min_void": {"type": "number", "default": 0.8, "description": "floor mode: empty vertical gap (m) that separates floor from ceiling / levels. Lower it for low crawls."},
+                "removed_path": {"type": "string", "description": "Optional: also save the removed part (vault) here."},
+            },
+            "required": ["input_path", "output_path"],
+        },
+    ),
+    Tool(
+        name="extract_sections",
+        description=(
+            "Vertical cross-sections from a LAS/LAZ (native, no CloudCompare). Give either `line` (two XY points: one section "
+            "from A to B) or a centerline (`centerline` list of XY vertices or `centerline_file` GeoJSON/CSV from QGIS) with "
+            "`spacing`: sections perpendicular to the centerline every `spacing` m, viewed looking along the centerline "
+            "(left side negative). Writes one LAS + one CSV (s, z, x, y) per section and a GeoJSON of the section traces "
+            "for the plan, and returns a picture of all profiles."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string", "description": "Absolute path of the LAS/LAZ (use the full, uncut cloud)."},
+                "output_dir": {"type": "string", "description": "Folder for the sections (created if missing)."},
+                "line": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "[[xA, yA], [xB, yB]] for a single section."},
+                "centerline": {"type": "array", "items": {"type": "array", "items": {"type": "number"}}, "description": "[[x, y], ...] polyline along the passage."},
+                "centerline_file": {"type": "string", "description": "GeoJSON (LineString) or CSV x,y with the centerline."},
+                "spacing": {"type": "number", "default": 2.0, "description": "Distance between sections along the centerline (m)."},
+                "start_offset": {"type": "number", "default": 0.0, "description": "Chainage of the first section (m)."},
+                "half_width": {"type": "number", "default": 6.0, "description": "Half length of each perpendicular section (m)."},
+                "thickness": {"type": "number", "default": 0.1, "description": "Slice thickness (m)."},
+                "prefix": {"type": "string", "description": "File name prefix (default: input name)."},
+            },
+            "required": ["input_path", "output_dir"],
+        },
+    ),
+    Tool(
+        name="register_scans",
+        description=(
+            "Join several scans into one cloud. Each scan is aligned with ICP (CloudCompare) onto the previous one "
+            "('chain', for scans taken one after another along a passage) or onto the first scan ('reference'); the "
+            "transformation is then applied to the original LAS points, so every attribute is kept. The merged file "
+            "gets a scan_id field (0 = first scan) to tell scans apart later. With icp=false scans already in the same "
+            "coordinates are only merged. ICP needs a rough pre-alignment (within some decimetres). LAS/LAZ inputs."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "scan_paths": {"type": "array", "items": {"type": "string"}, "minItems": 2, "description": "Absolute paths, in survey order; the first is the reference (does not move)."},
+                "output_path": {"type": "string", "description": "Merged result (.las or .laz). Aligned single scans are saved next to it."},
+                "mode": {"type": "string", "enum": ["chain", "reference"], "default": "chain"},
+                "icp": {"type": "boolean", "default": True},
+                "overlap": {"type": "number", "default": 60, "description": "Expected overlap % between consecutive scans."},
+                "iterations": {"type": "integer"},
+                "random_sampling_limit": {"type": "integer", "default": 50000},
+            },
+            "required": ["scan_paths", "output_path"],
+        },
+    ),
+    Tool(
         name="run_cloudcompare_command",
         description=(
             "Run an arbitrary CloudCompare command line (advanced). Do NOT include the binary path, "
@@ -965,12 +1057,13 @@ def handle_c2c_distances(args: dict) -> list[TextContent]:
         opts.append("-SPLIT_XYZ")
     if args.get("max_distance") is not None:
         opts += ["-MAX_DIST", str(args["max_distance"])]
+    sh = _shift(args["compared_path"], args["reference_path"])
     return _run_and_save(
         [args["compared_path"], args["reference_path"]],
         [
             *_export_fmt(out),
-            *_open(args["compared_path"]),
-            *_open(args["reference_path"]),
+            *_open(args["compared_path"], sh),
+            *_open(args["reference_path"], sh),
             "-C2C_DIST", *opts,
             "-POP_CLOUDS",  # drop the reference (last loaded) so only the compared cloud is saved
             *_save_clouds(out),
@@ -981,9 +1074,10 @@ def handle_c2c_distances(args: dict) -> list[TextContent]:
 
 def handle_c2m_distances(args: dict) -> list[TextContent]:
     out = args["output_path"]
+    sh = _shift(args["cloud_path"], args["mesh_path"])
     return _run_and_save(
         [args["cloud_path"], args["mesh_path"]],
-        [*_export_fmt(out), *_open(args["cloud_path"]), *_open(args["mesh_path"]), "-C2M_DIST", *_save_clouds(out)],
+        [*_export_fmt(out), *_open(args["cloud_path"], sh), *_open(args["mesh_path"], sh), "-C2M_DIST", *_save_clouds(out)],
         out,
     )
 
@@ -1001,18 +1095,25 @@ def handle_icp(args: dict) -> list[TextContent]:
         opts += ["-MIN_ERROR_DIFF", str(args["min_error_diff"])]
     if args.get("adjust_scale"):
         opts.append("-ADJUST_SCALE")
+    # keep the matrix next to the output (CloudCompare would write it next to the input)
+    opts += ["-OUTPUT_MATRIX_FILE", str(Path(out).with_suffix("")) + "_ICP_matrix.txt"]
+    sh = _shift(args["data_path"], args["model_path"])
     return _run_and_save(
         [args["data_path"], args["model_path"]],
         [
             *_export_fmt(out),
-            *_open(args["data_path"]),
-            *_open(args["model_path"]),
+            *_open(args["data_path"], sh),
+            *_open(args["model_path"], sh),
             "-ICP", *opts,
             "-POP_CLOUDS",  # drop the model (last loaded), keep the registered data cloud
             *_save_clouds(out),
         ],
         out,
-        extra={"note": "The 4x4 transformation matrix and final RMS are reported in 'log'."},
+        extra={
+            "matrix_file": str(Path(out).with_suffix("")) + "_ICP_matrix.txt",
+            "global_shift_used": sh,
+            "note": "Final RMS is in 'log'. The matrix is expressed in CloudCompare local coordinates (global + global_shift_used).",
+        },
     )
 
 
@@ -1067,8 +1168,9 @@ def handle_sor(args: dict) -> list[TextContent]:
 def handle_merge(args: dict) -> list[TextContent]:
     out = args["output_path"]
     opens: list[str] = []
+    sh = _shift(*args["input_paths"])
     for p in args["input_paths"]:
-        opens += _open(p)
+        opens += _open(p, sh)
     return _run_and_save(
         list(args["input_paths"]),
         [*_export_fmt(out), *opens, "-MERGE_CLOUDS", *_save_clouds(out)],
@@ -1090,6 +1192,234 @@ def handle_raw_command(args: dict) -> list[TextContent]:
     cleaned = [a for a in args["args"] if a.upper() != "-SILENT"]
     rc, stdout, stderr = cc_run(cleaned, cwd=args.get("working_directory"), managed=False)
     return _run_result(rc, stdout, stderr)
+
+
+# ── Survey handlers (native) ──────────────────────────────────────────────────
+
+def _require_las(*paths: str) -> str | None:
+    for p in paths:
+        if not survey.is_las(p):
+            return f"'{p}' is not LAS/LAZ. Convert it first with convert_format (e.g. to .laz)."
+    return None
+
+
+def _auto_check_sections(x: Any, y: Any) -> list[dict]:
+    """Three check sections across the longest plan axis, at 25 / 50 / 75 %."""
+    import numpy as np
+
+    ext_x, ext_y = float(x.max() - x.min()), float(y.max() - y.min())
+    along_x = ext_x >= ext_y
+    out = []
+    for i, f in enumerate((0.25, 0.5, 0.75)):
+        if along_x:
+            c = float(x.min() + f * ext_x)
+            origin, direction = (c, float(y.min())), (0.0, 1.0)
+            tx, ty = [c, c], [float(y.min()), float(y.max())]
+        else:
+            c = float(y.min() + f * ext_y)
+            origin, direction = (float(x.min()), c), (1.0, 0.0)
+            tx, ty = [float(x.min()), float(x.max())], [c, c]
+        mask, s = survey.section_masks(x, y, origin, direction, 0, 0.1, along_range=(-1e9, 1e9))
+        out.append({"name": f"C{i + 1}", "mask": mask, "s": s, "trace_x": tx, "trace_y": ty})
+    return out
+
+
+def handle_cut_ceiling(args: dict) -> list[ImageContent | TextContent]:
+    import numpy as np
+
+    src, out = args["input_path"], args["output_path"]
+    if err := _check_inputs(src) or _require_las(src, out) or (_require_las(args["removed_path"]) if args.get("removed_path") else None):
+        return _err(err)
+    las = survey.read_las(src)
+    x, y, z = np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)
+    mode = args.get("mode", "floor")
+    if mode == "absolute":
+        zlo = args.get("z_min", -np.inf)
+        zhi = args.get("z_max", np.inf)
+        if zlo == -np.inf and zhi == np.inf:
+            return _err("absolute mode needs z_min and/or z_max")
+        keep = (z >= zlo) & (z <= zhi)
+        hab = None
+        title = f"Cut at Z {zlo} … {zhi}"
+    else:
+        h = float(args.get("height", 1.5))
+        hmin = args.get("min_height")
+        keep, hab = survey.ceiling_cut_mask(
+            x, y, z,
+            cell=float(args.get("cell_size", 0.5)),
+            min_void=float(args.get("min_void", 0.8)),
+            h_min=None if hmin is None else float(hmin),
+            h_max=h,
+        )
+        title = (f"Plan slice {hmin}–{h} m above floor" if hmin is not None else f"Ceiling removed above {h} m from floor")
+
+    result = survey.subset_las(las, keep)
+    if hab is not None:
+        survey.add_float_field(result, "HeightAboveFloor", hab[keep], "height above local floor")
+    _prepare_output(out)
+    survey.write_las(result, out)
+    info: dict = {
+        "output": out,
+        "output_written": Path(out).is_file(),
+        "points_in": int(len(x)),
+        "points_kept": int(keep.sum()),
+        "points_removed": int((~keep).sum()),
+        "kept_percent": round(100.0 * float(keep.mean()), 1),
+        "output_size_mb": round(Path(out).stat().st_size / 1_048_576, 2),
+    }
+    if args.get("removed_path"):
+        rp = args["removed_path"]
+        _prepare_output(rp)
+        survey.write_las(survey.subset_las(las, ~keep), rp)
+        info["removed_path"] = rp
+    info["success"] = info["output_written"]
+    img = survey.plot_cut(x, y, z, keep, f"{Path(src).name} — {title}", _auto_check_sections(x, y))
+    return [
+        ImageContent(type="image", data=img, mimeType="image/png"),
+        TextContent(type="text", text=json.dumps(info, indent=2, ensure_ascii=False)),
+    ]
+
+
+def handle_extract_sections(args: dict) -> list[ImageContent | TextContent]:
+    import csv as _csv
+
+    import numpy as np
+
+    src, out_dir = args["input_path"], Path(args["output_dir"])
+    if err := _check_inputs(src) or _require_las(src):
+        return _err(err)
+    thickness = float(args.get("thickness", 0.1))
+    half_width = float(args.get("half_width", 6.0))
+    prefix = args.get("prefix") or Path(src).stem
+
+    defs: list[dict] = []
+    if args.get("line"):
+        (xa, ya), (xb, yb) = args["line"][0][:2], args["line"][1][:2]
+        length = math.hypot(xb - xa, yb - ya)
+        if length == 0:
+            return _err("line: the two points coincide")
+        defs.append({"name": "S01", "origin": (xa, ya), "dir": ((xb - xa) / length, (yb - ya) / length),
+                     "range": (0.0, length), "chainage": None, "trace": [[xa, ya], [xb, yb]]})
+    else:
+        if args.get("centerline_file"):
+            if err := _check_inputs(args["centerline_file"]):
+                return _err(err)
+            cl = survey.read_centerline(args["centerline_file"])
+        elif args.get("centerline"):
+            cl = [[float(p[0]), float(p[1])] for p in args["centerline"]]
+        else:
+            return _err("Give `line`, `centerline` or `centerline_file`.")
+        spacing = float(args.get("spacing", 2.0))
+        if spacing <= 0:
+            return _err("spacing must be > 0")
+        stations = survey.stations_along(cl, spacing, float(args.get("start_offset", 0.0)))
+        if len(stations) > 200:
+            return _err(f"{len(stations)} sections requested: increase spacing (max 200 per call).")
+        for i, st in enumerate(stations, 1):
+            d = st["dir"]
+            sec_dir = (float(d[1]), float(-d[0]))  # pointing to the right when looking along the centerline
+            o = (st["x"], st["y"])
+            defs.append({
+                "name": f"S{i:02d}", "origin": o, "dir": sec_dir, "range": (-half_width, half_width),
+                "chainage": st["chainage"],
+                "trace": [[o[0] - sec_dir[0] * half_width, o[1] - sec_dir[1] * half_width],
+                          [o[0] + sec_dir[0] * half_width, o[1] + sec_dir[1] * half_width]],
+            })
+
+    las = survey.read_las(src)
+    x, y, z = np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sections, summary, features = [], [], []
+    for d in defs:
+        mask, s = survey.section_masks(x, y, d["origin"], d["dir"], half_width, thickness, along_range=d["range"])
+        n = int(mask.sum())
+        base = out_dir / f"{prefix}_{d['name']}"
+        if n:
+            sec_las = survey.subset_las(las, mask)
+            survey.add_float_field(sec_las, "Distance", s[mask], "distance along section")
+            survey.write_las(sec_las, str(base) + ".laz")
+            with open(str(base) + ".csv", "w", newline="") as f:
+                w = _csv.writer(f)
+                w.writerow(["s", "z", "x", "y"])
+                for row in zip(np.round(s[mask], 4), np.round(z[mask], 4), np.round(x[mask], 4), np.round(y[mask], 4)):
+                    w.writerow(row)
+        zz = z[mask]
+        summary.append({
+            "name": d["name"], "chainage_m": d["chainage"], "points": n,
+            "z_min": round(float(zz.min()), 3) if n else None, "z_max": round(float(zz.max()), 3) if n else None,
+            "height_m": round(float(zz.max() - zz.min()), 2) if n else None,
+            "width_m": round(float(s[mask].max() - s[mask].min()), 2) if n else None,
+            "files": [str(base) + ".laz", str(base) + ".csv"] if n else [],
+        })
+        sections.append({"name": d["name"], "s": s[mask], "z": zz, "n": n, "xlim": d["range"], "chainage": d["chainage"]})
+        features.append({"type": "Feature",
+                         "properties": {"name": d["name"], "chainage": d["chainage"], "points": n},
+                         "geometry": {"type": "LineString", "coordinates": d["trace"]}})
+    traces = out_dir / f"{prefix}_section_traces.geojson"
+    traces.write_text(json.dumps({"type": "FeatureCollection", "features": features}, indent=1))
+    img = survey.plot_sections(sections, f"{Path(src).name} — {len(sections)} section(s), thickness {thickness} m")
+    info = {"output_dir": str(out_dir), "section_traces": str(traces), "sections": summary,
+            "empty_sections": [s["name"] for s in summary if not s["points"]]}
+    return [
+        ImageContent(type="image", data=img, mimeType="image/png"),
+        TextContent(type="text", text=json.dumps(info, indent=2, ensure_ascii=False)),
+    ]
+
+
+def handle_register_scans(args: dict) -> list[TextContent]:
+    import re
+
+    scans = list(args["scan_paths"])
+    out = args["output_path"]
+    if err := _check_inputs(*scans) or _require_las(*scans, out):
+        return _err(err)
+    out_dir = Path(out).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sh = _shift(*scans)
+    mode = args.get("mode", "chain")
+    use_icp = bool(args.get("icp", True))
+    aligned = [scans[0]]
+    report: list[dict] = [{"scan": scans[0], "scan_id": 0, "role": "reference"}]
+
+    for i, data in enumerate(scans[1:], 1):
+        if not use_icp:
+            aligned.append(data)
+            report.append({"scan": data, "scan_id": i, "role": "merged as is"})
+            continue
+        model = aligned[i - 1] if mode == "chain" else aligned[0]
+        stem = Path(data).stem
+        matrix_file = str(out_dir / f"{stem}_ICP_matrix.txt")
+        if Path(matrix_file).is_file():
+            Path(matrix_file).unlink()
+        opts = [
+            "-OVERLAP", str(int(args.get("overlap", 60))),
+            "-RANDOM_SAMPLING_LIMIT", str(int(args.get("random_sampling_limit", 50000))),
+            "-OUTPUT_MATRIX_FILE", matrix_file,
+        ]
+        if args.get("iterations"):
+            opts += ["-ITER", str(int(args["iterations"]))]
+        rc, stdout, stderr = cc_run([*_open(data, sh), *_open(model, sh), "-ICP", *opts])
+        rms = re.findall(r"RMS:\s*([0-9.eE+-]+)", stdout)
+        if rc != 0 or not Path(matrix_file).is_file():
+            return _ok({"success": False, "failed_at": data, "aligned_so_far": aligned,
+                        "log": _tail(stdout), "stderr": _tail(stderr, 20)})
+        las = survey.read_las(data)
+        survey.apply_rigid_transform(las, survey.read_matrix_file(matrix_file), sh)
+        dst = str(out_dir / f"{stem}_aligned{Path(out).suffix}")
+        survey.write_las(las, dst)
+        aligned.append(dst)
+        report.append({"scan": data, "scan_id": i, "aligned_onto": model, "aligned_file": dst,
+                       "rms_m": float(rms[-1]) if rms else None, "matrix_file": matrix_file})
+
+    _prepare_output(out)
+    merged = survey.merge_las_with_ids(aligned, out, "scan_id")
+    return _ok({
+        "success": Path(out).is_file(), "output": out,
+        "output_size_mb": round(Path(out).stat().st_size / 1_048_576, 2),
+        "mode": mode if use_icp else "merge only", "global_shift_used": sh,
+        "scans": report, **merged,
+        "note": "RMS of a few cm = good alignment; decimetres = check the pre-alignment. Filter or colour by scan_id to separate scans.",
+    })
 
 
 # ── Format helper ─────────────────────────────────────────────────────────────
@@ -1127,6 +1457,9 @@ _DISPATCH = {
     "merge_clouds": handle_merge,
     "convert_format": handle_convert,
     "run_cloudcompare_command": handle_raw_command,
+    "cut_ceiling": handle_cut_ceiling,
+    "extract_sections": handle_extract_sections,
+    "register_scans": handle_register_scans,
 }
 
 

@@ -30,6 +30,13 @@ Fork of [yufeioptimal/cloudcompare-mcp](https://github.com/yufeioptimal/cloudcom
 - Plan + two elevations at true scale (equal aspect), CRS shown when the LAS has one.
 - Blocking work runs off the MCP event loop; long CloudCompare jobs time out after 2 h (`CLOUDCOMPARE_TIMEOUT` in seconds).
 
+## New in v0.4.0
+
+- **`cut_ceiling`** — floor-relative ceiling cut. The plan is split into cells; each vertical column is split at empty gaps and segments alternate floor / ceiling (works with stacked galleries). Cells whose lowest surface is far above the neighbouring floor (occluded floor) are handled. Writes a `HeightAboveFloor` field. Returns a plan picture plus three check sections (kept / removed).
+- **`extract_sections`** — cross-sections looking along the centerline (left side negative), true scale.
+- **`register_scans`** — ICP by CloudCompare, but the transform is applied to the original points with laspy, so all LAS attributes survive; `scan_id` tells scans apart.
+- **Fix:** multi-file CloudCompare commands (C2C, C2M, ICP, merge) now use one explicit global shift for every file. Before, CloudCompare could re-centre each LAS differently and compute in mismatched frames. ICP matrix is written next to the output, not next to the input.
+
 ## Tools
 
 | Tool | CloudCompare needed | Description |
@@ -48,6 +55,9 @@ Fork of [yufeioptimal/cloudcompare-mcp](https://github.com/yufeioptimal/cloudcom
 | `merge_clouds` | ✓ | Merge several clouds |
 | `convert_format` | ✓ | LAS/LAZ, PLY, PCD, XYZ/ASC/TXT, E57, BIN, VTK, SBF |
 | `run_cloudcompare_command` | ✓ | Any CloudCompare command line (advanced) |
+| `cut_ceiling` | – | **Scappellamento**: remove the vault relative to the local floor (sloping passages, multi-level caves), or plan slice at a height band (e.g. 1 m) |
+| `extract_sections` | – | Vertical sections along a line or every N m perpendicular to a centerline (list or QGIS GeoJSON); LAS + CSV per section + GeoJSON traces + picture |
+| `register_scans` | ✓ (ICP) | Join several scans: ICP chain/reference alignment, transform applied to original LAS points, merged file with `scan_id` |
 
 All CloudCompare tools work on files in batch (CloudCompare's command-line mode). They do not drive an open CloudCompare window.
 
@@ -98,7 +108,7 @@ claude mcp add cloudcompare -- uvx --from git+https://github.com/Stratos915/clou
 
 ## Testing status
 
-Native tools are tested on synthetic tunnel clouds (spacing and surface density match the ground truth within 1 %, also from a 4 % subsample). CloudCompare command lines are generated per the CloudCompare 2.13 source and checked with a mock binary; they have not yet been run against a real CloudCompare install — please report issues.
+Tested on macOS (Apple Silicon) with CloudCompare 2.14 on a real TLS cave survey (555k points, UTM coordinates): SOR, spatial subsampling, global shift, ceiling cut and sections. `register_scans` transform and merge are verified against a known misalignment (error < 0.2 mm); the ICP step uses CloudCompare's own `-ICP`. Native density statistics are checked on synthetic tunnels.
 
 ## License
 

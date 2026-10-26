@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cloudcompare-mcp"
-version = "0.3.1"
+version = "0.4.0"
 description = "Cross-platform MCP server for CloudCompare point cloud processing (fork tuned for cave / 3D surveys)"
 readme = "README.md"
 license = { text = "MIT" }

@@ -102,9 +102,10 @@ def cc_run(
         log = ""
         if Path(log_path).is_file():
             log = Path(log_path).read_text(encoding="utf-8", errors="replace")
-    # Merge the log into stdout so callers see what CloudCompare did.
+    # On some platforms CloudCompare writes the same messages to stdout and to
+    # the log file; prefer the log file and fall back to stdout.
     if log.strip():
-        stdout = (stdout + "\n" + log).strip()
+        stdout = log
     return rc, stdout, stderr
 
 
@@ -815,8 +816,11 @@ def _err(msg: str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"error": msg}, indent=2, ensure_ascii=False))]
 
 
+_LOG_NOISE = ("[Plugin]", "Plugin found:", "New file extensions registered", "[Global Shift] Max abs.")
+
+
 def _tail(text: str, n: int = 60) -> str:
-    lines = [ln for ln in text.strip().splitlines() if ln.strip()]
+    lines = [ln for ln in text.strip().splitlines() if ln.strip() and not any(k in ln for k in _LOG_NOISE)]
     if len(lines) > n:
         lines = [f"… ({len(lines) - n} earlier lines omitted)"] + lines[-n:]
     return "\n".join(lines) or "(none)"

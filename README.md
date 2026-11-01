@@ -37,6 +37,16 @@ Fork of [yufeioptimal/cloudcompare-mcp](https://github.com/yufeioptimal/cloudcom
 - **`register_scans`** — ICP by CloudCompare, but the transform is applied to the original points with laspy, so all LAS attributes survive; `scan_id` tells scans apart.
 - **Fix:** multi-file CloudCompare commands (C2C, C2M, ICP, merge) now use one explicit global shift for every file. Before, CloudCompare could re-centre each LAS differently and compute in mismatched frames. ICP matrix is written next to the output, not next to the input.
 
+## New in v0.4.1 — `register_scans` for real-world surveys
+
+- `rotation`: `XYZ` (free ICP), `Z` (only rotation about the vertical, default — levelled TLS/SLAM), `NONE` (translation only). Georeferenced scans that are merely shifted, or scans with little overlap (< 20 %), need `NONE`: a free ICP slides along straight passages.
+- `engine`: `cloudcompare` (CloudCompare `-ICP` with `-ROT`) or `native` (robust trimmed translation-only ICP, no CloudCompare needed).
+- `mode`: `all_previous` (default — each scan aligned onto everything already aligned, best for networks of galleries), `chain`, `reference`.
+- Safety check: a result that moves a scan more than `max_shift` (2 m) or rotates it more than `max_rotation_deg` (5°) is rejected and the scan left in place, with a warning.
+- Contact statistics before/after for every scan (points within 15 cm of the model and their median gap).
+
+Tested on four georeferenced scans of the Leros hospital tunnels (2.7 M points, 5–12 % overlap): a free ICP slid by ~10 m; translation-only aligned them (vertical offsets of 10–48 cm), contact at junctions doubled and the median gap dropped from ~8 to ~5 cm.
+
 ## Tools
 
 | Tool | CloudCompare needed | Description |

@@ -857,22 +857,30 @@ TOOLS: list[Tool] = [
     Tool(
         name="register_scans",
         description=(
-            "Join several scans into one cloud. Each scan is aligned with ICP (CloudCompare) onto the previous one "
-            "('chain', for scans taken one after another along a passage) or onto the first scan ('reference'); the "
-            "transformation is then applied to the original LAS points, so every attribute is kept. The merged file "
-            "gets a scan_id field (0 = first scan) to tell scans apart later. With icp=false scans already in the same "
-            "coordinates are only merged. ICP needs a rough pre-alignment (within some decimetres). LAS/LAZ inputs."
+            "Join several scans into one cloud. Each scan is aligned and the transform is applied to the original LAS "
+            "points (every attribute kept); the merged file gets a scan_id field (0 = first scan). "
+            "rotation: 'XYZ' full ICP, 'Z' only rotation about the vertical (default; levelled TLS/SLAM), 'NONE' = "
+            "translation only — use NONE when scans are already georeferenced but shifted, or overlap is small "
+            "(< 20 %): with little overlap a free ICP slides along straight passages. engine 'cloudcompare' uses "
+            "CloudCompare's ICP; engine 'native' uses a robust trimmed translation-only ICP (no CloudCompare needed, "
+            "rotation must be NONE). Each result is checked: if it moves a scan more than max_shift or rotates it more "
+            "than max_rotation_deg the scan is NOT moved and a warning is returned. Reports contact before/after."
         ),
         inputSchema={
             "type": "object",
             "properties": {
-                "scan_paths": {"type": "array", "items": {"type": "string"}, "minItems": 2, "description": "Absolute paths, in survey order; the first is the reference (does not move)."},
+                "scan_paths": {"type": "array", "items": {"type": "string"}, "minItems": 2, "description": "Absolute LAS/LAZ paths. The first is the reference and does not move; put next the scans that touch it best."},
                 "output_path": {"type": "string", "description": "Merged result (.las or .laz). Aligned single scans are saved next to it."},
-                "mode": {"type": "string", "enum": ["chain", "reference"], "default": "chain"},
-                "icp": {"type": "boolean", "default": True},
-                "overlap": {"type": "number", "default": 60, "description": "Expected overlap % between consecutive scans."},
+                "mode": {"type": "string", "enum": ["all_previous", "chain", "reference"], "default": "all_previous",
+                         "description": "Align each scan onto: all scans aligned so far (best for networks of galleries), the previous one, or the first one."},
+                "rotation": {"type": "string", "enum": ["XYZ", "Z", "NONE"], "default": "Z"},
+                "engine": {"type": "string", "enum": ["cloudcompare", "native"], "default": "cloudcompare"},
+                "icp": {"type": "boolean", "default": True, "description": "false = scans already aligned, only merge."},
+                "overlap": {"type": "number", "default": 30, "description": "cloudcompare engine: expected overlap % with the model."},
                 "iterations": {"type": "integer"},
                 "random_sampling_limit": {"type": "integer", "default": 50000},
+                "max_shift": {"type": "number", "default": 2.0, "description": "Safety check: largest accepted movement (m)."},
+                "max_rotation_deg": {"type": "number", "default": 5.0, "description": "Safety check: largest accepted rotation (degrees)."},
             },
             "required": ["scan_paths", "output_path"],
         },
@@ -1368,57 +1376,119 @@ def handle_extract_sections(args: dict) -> list[ImageContent | TextContent]:
 
 def handle_register_scans(args: dict) -> list[TextContent]:
     import re
+    import tempfile as _tmp
+
+    import numpy as np
 
     scans = list(args["scan_paths"])
     out = args["output_path"]
     if err := _check_inputs(*scans) or _require_las(*scans, out):
         return _err(err)
+    mode = args.get("mode", "all_previous")
+    rotation = str(args.get("rotation", "Z")).upper()
+    engine = args.get("engine", "cloudcompare")
+    use_icp = bool(args.get("icp", True))
+    max_shift = float(args.get("max_shift", 2.0))
+    max_rot = float(args.get("max_rotation_deg", 5.0))
+    if engine == "native" and rotation != "NONE":
+        return _err("engine 'native' only does translation: set rotation to 'NONE' (or use engine 'cloudcompare').")
+
     out_dir = Path(out).parent
     out_dir.mkdir(parents=True, exist_ok=True)
     sh = _shift(*scans)
-    mode = args.get("mode", "chain")
-    use_icp = bool(args.get("icp", True))
-    aligned = [scans[0]]
-    report: list[dict] = [{"scan": scans[0], "scan_id": 0, "role": "reference"}]
+    ext = Path(out).suffix
 
-    for i, data in enumerate(scans[1:], 1):
-        if not use_icp:
-            aligned.append(data)
-            report.append({"scan": data, "scan_id": i, "role": "merged as is"})
-            continue
-        model = aligned[i - 1] if mode == "chain" else aligned[0]
-        stem = Path(data).stem
-        matrix_file = str(out_dir / f"{stem}_ICP_matrix.txt")
-        if Path(matrix_file).is_file():
-            Path(matrix_file).unlink()
-        opts = [
-            "-OVERLAP", str(int(args.get("overlap", 60))),
-            "-RANDOM_SAMPLING_LIMIT", str(int(args.get("random_sampling_limit", 50000))),
-            "-OUTPUT_MATRIX_FILE", matrix_file,
-        ]
-        if args.get("iterations"):
-            opts += ["-ITER", str(int(args["iterations"]))]
-        rc, stdout, stderr = cc_run([*_open(data, sh), *_open(model, sh), "-ICP", *opts])
-        rms = re.findall(r"RMS:\s*([0-9.eE+-]+)", stdout)
-        if rc != 0 or not Path(matrix_file).is_file():
-            return _ok({"success": False, "failed_at": data, "aligned_so_far": aligned,
-                        "log": _tail(stdout), "stderr": _tail(stderr, 20)})
-        las = survey.read_las(data)
-        survey.apply_rigid_transform(las, survey.read_matrix_file(matrix_file), sh)
-        dst = str(out_dir / f"{stem}_aligned{Path(out).suffix}")
-        survey.write_las(las, dst)
-        aligned.append(dst)
-        report.append({"scan": data, "scan_id": i, "aligned_onto": model, "aligned_file": dst,
-                       "rms_m": float(rms[-1]) if rms else None, "matrix_file": matrix_file})
+    def _xyz(las: Any) -> Any:
+        return np.column_stack([np.asarray(las.x), np.asarray(las.y), np.asarray(las.z)])
+
+    # local frame (shifted) for numerics
+    s_vec = np.asarray(sh or (0.0, 0.0, 0.0))
+    aligned_files = [scans[0]]
+    aligned_xyz = [_xyz(survey.read_las(scans[0])) + s_vec]
+    report: list[dict] = [{"scan": scans[0], "scan_id": 0, "role": "reference (fixed)"}]
+
+    with _tmp.TemporaryDirectory(prefix="ccmcp_reg_") as tmpdir:
+        for i, data in enumerate(scans[1:], 1):
+            las = survey.read_las(data)
+            src = _xyz(las) + s_vec
+            if mode == "chain":
+                model_idx = [i - 1]
+            elif mode == "reference":
+                model_idx = [0]
+            else:
+                model_idx = list(range(i))
+            ref = np.vstack([aligned_xyz[k] for k in model_idx])
+            entry: dict = {"scan": data, "scan_id": i,
+                           "aligned_onto": [Path(aligned_files[k]).name for k in model_idx],
+                           "before": survey.contact_stats(src, ref)}
+
+            matrix = np.eye(4)
+            if use_icp:
+                if engine == "native":
+                    t = survey.translation_icp(src, ref)
+                    matrix[:3, 3] = t
+                    entry["method"] = "native translation-only ICP"
+                else:
+                    if len(model_idx) == 1:
+                        model_file = aligned_files[model_idx[0]]
+                    else:
+                        model_file = str(Path(tmpdir) / f"model_{i}.laz")
+                        survey.merge_las_with_ids([aligned_files[k] for k in model_idx], model_file, "scan_id")
+                    matrix_file = str(out_dir / f"{Path(data).stem}_ICP_matrix.txt")
+                    if Path(matrix_file).is_file():
+                        Path(matrix_file).unlink()
+                    opts = [
+                        "-OVERLAP", str(int(args.get("overlap", 30))),
+                        "-RANDOM_SAMPLING_LIMIT", str(int(args.get("random_sampling_limit", 50000))),
+                        "-ROT", rotation,
+                        "-OUTPUT_MATRIX_FILE", matrix_file,
+                    ]
+                    if args.get("iterations"):
+                        opts += ["-ITER", str(int(args["iterations"]))]
+                    rc, stdout, stderr = cc_run([*_open(data, sh), *_open(model_file, sh), "-ICP", *opts])
+                    if rc != 0 or not Path(matrix_file).is_file():
+                        return _ok({"success": False, "failed_at": data, "aligned_so_far": aligned_files,
+                                    "log": _tail(stdout), "stderr": _tail(stderr, 20)})
+                    matrix = survey.read_matrix_file(matrix_file)
+                    rms = re.findall(r"RMS:\s*([0-9.eE+-]+)", stdout)
+                    entry.update({"method": f"CloudCompare ICP, rotation {rotation}",
+                                  "cc_rms_m": float(rms[-1]) if rms else None, "matrix_file": matrix_file})
+
+                shift_m = float(np.linalg.norm(matrix[:3, 3]))
+                rot_deg = survey.rotation_angle_deg(matrix)
+                entry["translation_m"] = np.round(matrix[:3, 3], 3).tolist()
+                entry["rotation_deg"] = round(rot_deg, 3)
+                if shift_m > max_shift or rot_deg > max_rot:
+                    entry["warning"] = (f"Rejected: shift {shift_m:.2f} m / rotation {rot_deg:.2f}° exceeds the limits "
+                                        f"({max_shift} m / {max_rot}°). The ICP probably slid (too little overlap). "
+                                        "Scan left where it was; try rotation 'NONE', another order, or a manual pre-alignment.")
+                    matrix = np.eye(4)
+            else:
+                entry["method"] = "merge only"
+
+            moved = src @ matrix[:3, :3].T + matrix[:3, 3]
+            entry["after"] = survey.contact_stats(moved, ref)
+            if not np.allclose(matrix, np.eye(4)):
+                survey.apply_rigid_transform(las, matrix, sh)
+                dst = str(out_dir / f"{Path(data).stem}_aligned{ext}")
+                survey.write_las(las, dst)
+                entry["aligned_file"] = dst
+                aligned_files.append(dst)
+            else:
+                aligned_files.append(data)
+            aligned_xyz.append(moved)
+            report.append(entry)
 
     _prepare_output(out)
-    merged = survey.merge_las_with_ids(aligned, out, "scan_id")
+    merged = survey.merge_las_with_ids(aligned_files, out, "scan_id")
+    warnings = [r["scan"] for r in report if "warning" in r]
     return _ok({
         "success": Path(out).is_file(), "output": out,
         "output_size_mb": round(Path(out).stat().st_size / 1_048_576, 2),
-        "mode": mode if use_icp else "merge only", "global_shift_used": sh,
-        "scans": report, **merged,
-        "note": "RMS of a few cm = good alignment; decimetres = check the pre-alignment. Filter or colour by scan_id to separate scans.",
+        "mode": mode, "rotation": rotation if use_icp else None, "engine": engine if use_icp else None,
+        "global_shift_used": sh, "scans": report, "rejected_alignments": warnings, **merged,
+        "note": "before/after: points within 15 cm of the model and their median gap. A good alignment has more "
+                "contact points and a smaller gap (a few cm). scan_id separates the scans in the merged file.",
     })
 
 

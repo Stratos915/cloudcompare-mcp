@@ -142,6 +142,63 @@ def merge_las_with_ids(paths: list[str], output: str, field: str = "scan_id") ->
     return {"points_per_scan": counts, "total_points": int(n_total)}
 
 
+# ── Registration helpers ─────────────────────────────────────────────────────
+
+
+def _sample(xyz: Any, n: int, seed: int = 0) -> Any:
+    if len(xyz) <= n:
+        return xyz
+    return xyz[np.random.default_rng(seed).choice(len(xyz), n, replace=False)]
+
+
+def translation_icp(src: Any, ref: Any, max_dist: float = 0.6, iterations: int = 60,
+                    trim: float = 70.0, sample: int = 250_000) -> Any:
+    """Translation-only ICP (no rotation), robust to small overlaps.
+
+    Uses only point pairs closer than a shrinking search radius and keeps the best
+    `trim` percent of them, so the parts of the two scans that do not overlap do not
+    pull the solution. Returns the 3-vector to add to `src`.
+    """
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(ref)
+    pts = _sample(src, sample)
+    t = np.zeros(3)
+    radius = max_dist
+    for _ in range(iterations):
+        q = pts + t
+        d, j = tree.query(q, distance_upper_bound=radius)
+        ok = np.isfinite(d)
+        if ok.sum() < 200:
+            break
+        dm = d[ok]
+        keep = dm <= np.percentile(dm, trim)
+        step = (ref[j[ok][keep]] - q[ok][keep]).mean(axis=0)
+        t = t + step
+        radius = max(0.12, radius * 0.9)
+        if np.linalg.norm(step) < 1e-4 and radius <= 0.12:
+            break
+    return t
+
+
+def contact_stats(src: Any, ref: Any, radius: float = 0.15, sample: int = 250_000) -> dict:
+    """How well two scans touch: points of src within `radius` of ref and their median gap."""
+    from scipy.spatial import cKDTree
+
+    pts = _sample(src, sample, seed=2)
+    d, _ = cKDTree(ref).query(pts, distance_upper_bound=radius)
+    ok = np.isfinite(d)
+    return {
+        "contact_points": int(ok.sum()),
+        "median_gap_m": round(float(np.median(d[ok])), 4) if ok.any() else None,
+    }
+
+
+def rotation_angle_deg(matrix: Any) -> float:
+    r = np.asarray(matrix, dtype=np.float64)[:3, :3]
+    return float(np.degrees(np.arccos(np.clip((np.trace(r) - 1) / 2, -1.0, 1.0))))
+
+
 # ── Ceiling cut (scappellamento) ─────────────────────────────────────────────
 
 

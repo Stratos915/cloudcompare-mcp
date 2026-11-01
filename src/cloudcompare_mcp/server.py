@@ -1482,8 +1482,37 @@ def handle_register_scans(args: dict) -> list[TextContent]:
     _prepare_output(out)
     merged = survey.merge_las_with_ids(aligned_files, out, "scan_id")
     warnings = [r["scan"] for r in report if "warning" in r]
+
+    # GeoJSON for QGIS: footprint of every aligned scan with its correction
+    epsg = survey.epsg_of(survey.read_las(scans[0]).header)
+    features = []
+    for k, r in enumerate(report):
+        xyz = aligned_xyz[k] - s_vec
+        try:
+            geom = survey.footprint(xyz).__geo_interface__
+        except Exception:  # noqa: BLE001 — shapely missing or degenerate cloud
+            lo, hi = xyz.min(axis=0), xyz.max(axis=0)
+            geom = {"type": "Polygon", "coordinates": [[[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]], [lo[0], lo[1]]]]}
+        t = r.get("translation_m") or [0.0, 0.0, 0.0]
+        props = {
+            "scan_id": r["scan_id"], "nome": Path(r["scan"]).stem, "ruolo": "riferimento" if k == 0 else "allineata",
+            "punti": merged["points_per_scan"][k],
+            "dx_m": t[0], "dy_m": t[1], "dz_m": t[2], "rot_deg": r.get("rotation_deg", 0.0),
+            "z_min": round(float(xyz[:, 2].min()), 2), "z_max": round(float(xyz[:, 2].max()), 2),
+            "contatto_prima": (r.get("before") or {}).get("contact_points"),
+            "scarto_prima_m": (r.get("before") or {}).get("median_gap_m"),
+            "contatto_dopo": (r.get("after") or {}).get("contact_points"),
+            "scarto_dopo_m": (r.get("after") or {}).get("median_gap_m"),
+            "avviso": r.get("warning"),
+        }
+        features.append({"type": "Feature", "properties": props, "geometry": geom})
+    geojson_path = str(Path(out).with_suffix("")) + "_scansioni.geojson"
+    survey.write_geojson(features, geojson_path, epsg)
+    report_path = str(Path(out).with_suffix("")) + "_report.json"
+    Path(report_path).write_text(json.dumps({"epsg": epsg, "global_shift_used": sh, "mode": mode, "rotation": rotation,
+                                             "engine": engine, "scans": report}, indent=1, ensure_ascii=False))
     return _ok({
-        "success": Path(out).is_file(), "output": out,
+        "success": Path(out).is_file(), "output": out, "geojson": geojson_path, "report": report_path, "epsg": epsg,
         "output_size_mb": round(Path(out).stat().st_size / 1_048_576, 2),
         "mode": mode, "rotation": rotation if use_icp else None, "engine": engine if use_icp else None,
         "global_shift_used": sh, "scans": report, "rejected_alignments": warnings, **merged,

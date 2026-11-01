@@ -97,6 +97,49 @@ def read_matrix_file(path: str) -> Any:
     return np.array(rows[:4])
 
 
+_CRS_VLR_TYPES = ("GeoKeyDirectoryVlr", "GeoDoubleParamsVlr", "GeoAsciiParamsVlr", "WktCoordinateSystemVlr")
+
+
+def copy_crs_vlrs(src_header: Any, dst_header: Any) -> None:
+    """Copy the coordinate-system records (GeoTIFF keys / WKT) without needing pyproj."""
+    import copy
+
+    for v in src_header.vlrs:
+        if type(v).__name__ in _CRS_VLR_TYPES:
+            dst_header.vlrs.append(copy.deepcopy(v))
+    if getattr(src_header, "global_encoding", None) is not None and any(
+        type(v).__name__ == "WktCoordinateSystemVlr" for v in src_header.vlrs
+    ):
+        dst_header.global_encoding.wkt = True
+
+
+def epsg_of(header: Any) -> int | None:
+    """EPSG code from the GeoTIFF keys (3072 projected, 2048 geographic), or None."""
+    for v in header.vlrs:
+        for k in getattr(v, "geo_keys", []) or []:
+            if k.id in (3072, 2048) and k.tiff_tag_location == 0 and 1024 < k.value_offset < 32767:
+                return int(k.value_offset)
+    return None
+
+
+def footprint(xyz: Any, cell: float = 0.25, simplify: float = 0.1) -> Any:
+    """Plan footprint (shapely geometry) of a cloud: union of occupied grid cells."""
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+
+    ij = np.unique(np.floor(xyz[:, :2] / cell).astype(np.int64), axis=0)
+    cells = [box(i * cell, j * cell, (i + 1) * cell, (j + 1) * cell) for i, j in ij]
+    return unary_union(cells).buffer(cell * 0.3).buffer(-cell * 0.3).simplify(simplify)
+
+
+def write_geojson(features: list[dict], path: str, epsg: int | None) -> None:
+    fc: dict = {"type": "FeatureCollection", "features": features}
+    if epsg:
+        fc["crs"] = {"type": "name", "properties": {"name": f"urn:ogc:def:crs:EPSG::{epsg}"}}
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(fc, ensure_ascii=False))
+
+
 def merge_las_with_ids(paths: list[str], output: str, field: str = "scan_id") -> dict:
     """Merge LAS/LAZ files into one, keeping all standard attributes and adding scan_id.
 
@@ -113,12 +156,7 @@ def merge_las_with_ids(paths: list[str], output: str, field: str = "scan_id") ->
     all_xyz = np.vstack([np.column_stack([np.asarray(c.x), np.asarray(c.y), np.asarray(c.z)]) for c in clouds])
     header.offsets = np.floor(all_xyz.min(axis=0))
     header.add_extra_dim(laspy.ExtraBytesParams(name=field, type=np.uint16, description="source scan index"))
-    try:
-        crs = ref.header.parse_crs()
-        if crs is not None:
-            header.add_crs(crs)
-    except Exception:  # noqa: BLE001
-        pass
+    copy_crs_vlrs(ref.header, header)
 
     out = laspy.LasData(header)
     n_total = len(all_xyz)

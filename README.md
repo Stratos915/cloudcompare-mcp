@@ -45,6 +45,8 @@ Fork of [yufeioptimal/cloudcompare-mcp](https://github.com/yufeioptimal/cloudcom
 - Safety check: a result that moves a scan more than `max_shift` (2 m) or rotates it more than `max_rotation_deg` (5°) is rejected and the scan left in place, with a warning.
 - Contact statistics before/after for every scan (points within 15 cm of the model and their median gap).
 
+v0.4.2: the merged file keeps the coordinate system of the reference scan (GeoTIFF keys / WKT copied without pyproj), and `register_scans` also writes `<output>_scansioni.geojson` (footprint of every scan with its correction and contact before/after, ready for QGIS) and `<output>_report.json`.
+
 Tested on four georeferenced scans of the Leros hospital tunnels (2.7 M points, 5–12 % overlap): a free ICP slid by ~10 m; translation-only aligned them (vertical offsets of 10–48 cm), contact at junctions doubled and the median gap dropped from ~8 to ~5 cm.
 
 ## Tools
